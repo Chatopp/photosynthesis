@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>动态光合/呼吸模拟 v10.1 (水草缸/环境气体可视化/错误修复尝试)</title> <!-- Version Bump -->
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #f0f5f8; }
+        canvas { display: block; touch-action: none; }
+        .dg.main { z-index: 20 !important; }
+        #infoOverlay { position: absolute; top: 20px; left: 20px; background-color: rgba(0,0,0,0.75); color: white; padding: 18px 25px; border-radius: 8px; font-family: sans-serif, "Microsoft YaHei", "SimHei"; font-size: 18px; line-height: 1.8;}
+        #infoOverlay span { display: inline-block; min-width: 85px; text-align: right; margin-left: 10px; font-weight: bold; }
+        #infoOverlay .unit { font-size: 0.9em; color: #ccc; margin-left: 6px; font-weight: normal; }
+        #infoOverlay hr { border-color: rgba(255,255,255,0.4); margin: 8px 0; }
+        .dg.main { font-size: 14px; } .dg li:not(.folder) { line-height: 1.7; padding: 5px 0; min-height: 32px; }
+        .dg .closed li:not(.folder) { padding-top: 0; padding-bottom: 0; line-height: normal; min-height: auto; }
+        .dg input[type=text], .dg select { padding: 6px 4px; font-size: 14px; margin-top: 2px; }
+        .dg .button { padding: 8px 10px; font-size: 14px; line-height: 1.3; margin-top: 3px; margin-bottom: 3px; }
+        .dg .slider { height: auto; margin-top: 4px; } .dg .cr.number input[type=text] { margin-top: 0; }
+        .dg .folder .title { font-size: 15px; line-height: 1.8; }
+    </style>
+</head>
+<body>
+    <div id="infoOverlay">
+        <div>状态: <span id="simStatus">停止</span></div>
+        <div>内部 CO₂:<span id="internalCo2">400.0</span><span class="unit">ppm</span></div>
+        <div>内部 O₂:<span id="internalO2">21.00</span><span class="unit">%</span></div>
+        <hr>
+        <div>总光合:<span id="grossPhotoRate">0.00</span><span class="unit">µmol</span></div>
+        <div>呼吸:<span id="respRate">0.00</span><span class="unit">µmol</span></div>
+        <div>净光合:<span id="netPhotoRate">0.00</span><span class="unit">µmol</span></div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.6/dat.gui.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/utils/MeshSurfaceSampler.js"></script>
+
+    <script>
+        window.onerror = function (message, source, lineno, colno, error) {
+            console.error("全局错误 (Global Error):", message, "at", source, lineno + ":" + colno, error);
+            alert(`发生错误 (Error Occurred): ${message}\n请检查浏览器控制台获取详细信息 (Please check browser console for details).`);
+            if (typeof simParams !== 'undefined') simParams.isRunning = false; // Check if simParams exists
+            if (typeof updateUIStatus === 'function') updateUIStatus(); // Check if updateUIStatus exists
+        };
+
+        let scene, camera, renderer, controls, externalLight;
+        function initScene() { /* ... Scene setup largely unchanged ... */
+            scene = new THREE.Scene(); scene.background = new THREE.Color(0xf0f5f8); scene.fog = new THREE.Fog(0xf0f5f8, 250, 800);
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.1, 1500); camera.position.set(0,60,150); camera.lookAt(0,25,0);
+            renderer = new THREE.WebGLRenderer({antialias:true, logarithmicDepthBuffer:true}); renderer.setPixelRatio(window.devicePixelRatio); renderer.setSize(window.innerWidth,window.innerHeight); renderer.shadowMap.enabled=true; renderer.shadowMap.type=THREE.PCFSoftShadowMap; document.body.appendChild(renderer.domElement);
+            controls = new THREE.OrbitControls(camera,renderer.domElement); controls.enableDamping=true; controls.dampingFactor=0.1; controls.target.set(0,25,0);
+            const ambientLight = new THREE.AmbientLight(0xffffff,0.75); scene.add(ambientLight);
+            externalLight = new THREE.DirectionalLight(0xffffff,0.85); externalLight.position.set(40,80,50); externalLight.castShadow=true; externalLight.shadow.mapSize.width=1024; externalLight.shadow.mapSize.height=1024; externalLight.shadow.camera.near=10; externalLight.shadow.camera.far=200; Object.assign(externalLight.shadow.camera,{left:-60,right:60,top:60,bottom:-60}); externalLight.shadow.bias=-0.001; scene.add(externalLight);
+            const groundGeo=new THREE.PlaneGeometry(1000,1000); const groundMat=new THREE.MeshStandardMaterial({color:0xd0d8dc,roughness:0.95,metalness:0.1}); const groundMesh=new THREE.Mesh(groundGeo,groundMat); groundMesh.rotation.x=-Math.PI/2; groundMesh.position.y=-0.1; groundMesh.receiveShadow=true; scene.add(groundMesh);
+        }
+
+        const beakerRadius=30; const beakerHeight=70; const liquidHeight=beakerHeight*0.8; const liquidRadius=beakerRadius*0.95;
+        let beakerMesh, liquidMesh;
+        function createBeaker() { /* ... Beaker creation unchanged ... */
+            const beakerWallThickness = 0.8; const radialSegments = 32;
+            const beakerGeo = new THREE.CylinderGeometry(beakerRadius, beakerRadius, beakerHeight, radialSegments, 1, true); const beakerMat = new THREE.MeshPhysicalMaterial({ color: 0xcce0ff, metalness: 0.1, roughness: 0.05, transmission: 0.95, transparent: true, side: THREE.DoubleSide, ior: 1.5, thickness: beakerWallThickness }); beakerMesh = new THREE.Mesh(beakerGeo, beakerMat); beakerMesh.position.y = beakerHeight / 2; scene.add(beakerMesh);
+            const baseGeo = new THREE.CylinderGeometry(beakerRadius, beakerRadius, 1.5, radialSegments); const baseMat = new THREE.MeshStandardMaterial({color: 0xcccccc, roughness: 0.3}); const baseMesh = new THREE.Mesh(baseGeo, baseMat); baseMesh.position.y = 0.75; baseMesh.castShadow = true; scene.add(baseMesh);
+            const liquidGeo = new THREE.CylinderGeometry(liquidRadius, liquidRadius, liquidHeight, radialSegments); const liquidMat = new THREE.MeshPhysicalMaterial({ color: 0x6fa8dc, metalness: 0.0, roughness: 0.1, transmission: 0.9, transparent: true, opacity: 0.6, ior: 1.33, thickness: liquidRadius * 0.5 }); liquidMesh = new THREE.Mesh(liquidGeo, liquidMat); liquidMesh.position.y = liquidHeight / 2; liquidMesh.receiveShadow = true; scene.add(liquidMesh);
+        }
+
+        let sampleablePlantMeshes = []; const plantColorLow = new THREE.Color(0x2E8B57); const plantColorHigh = new THREE.Color(0x3CB371);
+        const targetPlantColor = new THREE.Color().copy(plantColorLow); let plantMaterial;
+        function createPlants(clumpCount = 7) { /* ... Plant creation (Vallisneria-like) unchanged ... */
+            sampleablePlantMeshes=[];plantMaterial=new THREE.MeshPhysicalMaterial({color:plantColorLow.getHex(),metalness:0.0,roughness:0.6,transparent:true,opacity:0.90,ior:1.33,side:THREE.DoubleSide});
+            for(let i=0;i<clumpCount;i++){const plantClumpGroup=new THREE.Group();const numLeavesPerClump=3+Math.floor(Math.random()*4);
+                for(let j=0;j<numLeavesPerClump;j++){const leafHeight=20+Math.random()*25;const leafWidth=0.7+Math.random()*0.6;const heightSegments=20;const leafGeo=new THREE.PlaneGeometry(leafWidth,leafHeight,1,heightSegments);const positionsAttr=leafGeo.attributes.position;const waveFrequency=(Math.random()*1.5+1.5);const waveAmplitude=leafWidth*(0.3+Math.random()*0.5);const twistTotalTurns=(Math.random()*0.3+0.1);
+                    for(let v_seg=0;v_seg<=heightSegments;v_seg++){const yPos=-leafHeight/2+(v_seg/heightSegments)*leafHeight;const normalizedHeight=v_seg/heightSegments;const waveXOffset=Math.sin(normalizedHeight*waveFrequency*Math.PI*2)*waveAmplitude;const twistAngle=normalizedHeight*twistTotalTurns*Math.PI*2;const cosTwist=Math.cos(twistAngle);const sinTwist=Math.sin(twistAngle);
+                        for(let u_seg=0;u_seg<=1;u_seg++){const vertexIndex=v_seg*2+u_seg;const originalX=(u_seg===0)?-leafWidth/2:leafWidth/2;let currentX=originalX+waveXOffset;let currentZ=0;const newX=currentX*cosTwist-currentZ*sinTwist;const newZ=currentX*sinTwist+currentZ*cosTwist;positionsAttr.setX(vertexIndex,newX);positionsAttr.setZ(vertexIndex,newZ);}}
+                    positionsAttr.needsUpdate=true;leafGeo.computeVertexNormals();const leafMesh=new THREE.Mesh(leafGeo,plantMaterial);leafMesh.castShadow=true;leafMesh.receiveShadow=true;leafMesh.position.y=leafHeight/2-0.1;const angleAroundBase=(j/numLeavesPerClump)*Math.PI*1.8+(Math.random()-0.5)*0.6;const tiltOutwardAngle=(Math.PI/9)+(Math.random()*Math.PI/10);const tempParent=new THREE.Object3D();tempParent.add(leafMesh);leafMesh.rotation.x=tiltOutwardAngle;tempParent.rotation.y=angleAroundBase;plantClumpGroup.add(tempParent);sampleablePlantMeshes.push(leafMesh);}
+                const r=Math.random()*(liquidRadius*0.8);const angle=Math.random()*Math.PI*2;plantClumpGroup.position.set(r*Math.cos(angle),1.5,r*Math.sin(angle));scene.add(plantClumpGroup);}
+            console.log(`Created ${clumpCount} plant clumps. Sampleable meshes: ${sampleablePlantMeshes.length}`);scene.updateMatrixWorld(true);setupSurfaceSamplers();
+        }
+
+        let surfaceSamplers=[]; let totalPlantSurfaceArea=0; const _position=new THREE.Vector3(),_normal=new THREE.Vector3(),_color=new THREE.Color();
+        let samplersReady=false; const _matrix=new THREE.Matrix4();
+        function setupSurfaceSamplers() { /* ... Surface sampler setup unchanged ... */
+            console.log("Setting up surface samplers...");surfaceSamplers=[];totalPlantSurfaceArea=0;samplersReady=false;let buildErrors=0;if(!sampleablePlantMeshes||sampleablePlantMeshes.length===0){console.warn("No plant meshes.");return;}
+            sampleablePlantMeshes.forEach((pm,idx)=>{if(pm&&pm.geometry&&pm.geometry.attributes.position&&pm.geometry.attributes.position.count>0){try{const sampler=new THREE.MeshSurfaceSampler(pm).build();let area=1;if(pm.geometry.type==="PlaneGeometry"){const p=pm.geometry.parameters;area=p.width*p.height*2;}if(sampler&&area>0){surfaceSamplers.push({sampler,mesh:pm,area});totalPlantSurfaceArea+=area;}else{console.warn(`Sampler build failed for plant mesh ${idx}`);buildErrors++;}}catch(e){console.error(`Error building sampler ${idx}:`,e);buildErrors++;}}else{console.warn(`Invalid geom for plant mesh ${idx}`);buildErrors++;}});
+            if(surfaceSamplers.length>0){console.log(`Built ${surfaceSamplers.length} samplers. Area: ${totalPlantSurfaceArea.toFixed(2)}. Errors: ${buildErrors}`);samplersReady=true;initGasParticles();initBubbles();}else{console.error(`Failed plant samplers. Errors: ${buildErrors}`);samplersReady=false;}
+        }
+
+        const gasParticleCount=800; let gasParticlesGeo,gasParticleMaterial,gasParticleSystem; let gasPositions,gasColors,gasLifetimes,gasOriginNormals,gasIsOutward;
+        const colorO2_uptake=new THREE.Color(0x90EE90); const colorCO2_default=new THREE.Color(0xADD8E6); const colorO2_release_red=new THREE.Color(0xFF0000);
+        let gasParticlesToEmit=0; const gasMaxParticleLifetime=1.8; const gasSpeed=6;
+        function initGasParticles(){ /* ... Plant gas particles unchanged ... */
+            if(!samplersReady){return;}if(gasParticleSystem)scene.remove(gasParticleSystem);if(gasParticlesGeo)gasParticlesGeo.dispose();if(gasParticleMaterial)gasParticleMaterial.dispose();gasParticlesGeo=new THREE.BufferGeometry();gasPositions=new Float32Array(gasParticleCount*3);gasColors=new Float32Array(gasParticleCount*3);gasLifetimes=new Float32Array(gasParticleCount);gasOriginNormals=new Float32Array(gasParticleCount*3);gasIsOutward=new Float32Array(gasParticleCount);
+            for(let i=0;i<gasParticleCount;i++){gasPositions[i*3+1]=-10000;gasLifetimes[i]=0;gasOriginNormals[i*3]=0;gasOriginNormals[i*3+1]=1;gasOriginNormals[i*3+2]=0;gasIsOutward[i]=1.0;colorCO2_default.toArray(gasColors,i*3);}
+            gasParticlesGeo.setAttribute('position',new THREE.BufferAttribute(gasPositions,3));gasParticlesGeo.setAttribute('color',new THREE.BufferAttribute(gasColors,3));gasParticlesGeo.setAttribute('lifetime',new THREE.BufferAttribute(gasLifetimes,1));gasParticlesGeo.setAttribute('originNormal',new THREE.BufferAttribute(gasOriginNormals,3));gasParticlesGeo.setAttribute('isOutward',new THREE.BufferAttribute(gasIsOutward,1));
+            gasParticleMaterial=new THREE.PointsMaterial({size:0.6,vertexColors:true,transparent:true,opacity:0.9,sizeAttenuation:true,depthWrite:false,blending:THREE.AdditiveBlending});gasParticleSystem=new THREE.Points(gasParticlesGeo,gasParticleMaterial);scene.add(gasParticleSystem);
+        }
+        function resetGasParticle(idx,isNetO2Rel){ /* ... Plant gas particle reset unchanged ... */
+            if(!samplersReady||surfaceSamplers.length===0)return;try{let tA=Math.random()*totalPlantSurfaceArea;let sSI=surfaceSamplers[surfaceSamplers.length-1];for(const inf of surfaceSamplers){tA-=inf.area;if(tA<=0){sSI=inf;break;}}const smp=sSI.sampler;const srcM=sSI.mesh;smp.sample(_position,_normal);srcM.localToWorld(_position);_normal.transformDirection(srcM.matrixWorld).normalize();
+            gasPositions[idx*3+0]=_position.x;gasPositions[idx*3+1]=_position.y;gasPositions[idx*3+2]=_position.z;gasOriginNormals[idx*3+0]=_normal.x;gasOriginNormals[idx*3+1]=_normal.y;gasOriginNormals[idx*3+2]=_normal.z;gasIsOutward[idx]=isNetO2Rel?1.0:-1.0;gasLifetimes[idx]=gasMaxParticleLifetime*(0.7+Math.random()*0.3);(isNetO2Rel?colorO2_release_red:colorO2_uptake).toArray(gasColors,idx*3);}catch(e){console.error("Error resetGasParticle:",e);gasPositions[idx*3+1]=-10000;gasLifetimes[idx]=0;}
+        }
+
+        const bubbleMaxCount=300; let bubbleMesh,bubbleGeometry,bubbleMaterial; const bubbleData=[]; const bubbleSpeed=10; const bubbleMaxLifetime=2.5; let bubblesToEmit=0;
+        function initBubbles(){ /* ... Bubble init unchanged ... */
+            if(!samplersReady){return;}if(bubbleMesh)scene.remove(bubbleMesh);if(bubbleGeometry)bubbleGeometry.dispose();if(bubbleMaterial)bubbleMaterial.dispose();bubbleData.length=0;bubbleGeometry=new THREE.SphereGeometry(0.3,8,6);bubbleMaterial=new THREE.MeshPhysicalMaterial({color:colorO2_release_red.getHex(),metalness:0.0,roughness:0.1,transmission:0.85,transparent:true,opacity:0.85,ior:1.1});bubbleMesh=new THREE.InstancedMesh(bubbleGeometry,bubbleMaterial,bubbleMaxCount);bubbleMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);bubbleMesh.castShadow=false;bubbleMesh.receiveShadow=false;
+            for(let i=0;i<bubbleMaxCount;i++){_matrix.identity().scale(new THREE.Vector3(0,0,0));bubbleMesh.setMatrixAt(i,_matrix);bubbleData.push({lifetime:0,velocity:new THREE.Vector3(0,bubbleSpeed,0),matrix:new THREE.Matrix4().copy(_matrix)}); }bubbleMesh.instanceMatrix.needsUpdate=true;scene.add(bubbleMesh);
+        }
+        function resetBubble(idx){ /* ... Bubble reset unchanged ... */
+            if(!samplersReady||surfaceSamplers.length===0||idx>=bubbleMaxCount)return;try{let tA=Math.random()*totalPlantSurfaceArea;let sSI=surfaceSamplers[surfaceSamplers.length-1];for(const inf of surfaceSamplers){tA-=inf.area;if(tA<=0){sSI=inf;break;}}const smp=sSI.sampler;const srcM=sSI.mesh;smp.sample(_position,_normal);srcM.localToWorld(_position);_normal.transformDirection(srcM.matrixWorld).normalize();_position.addScaledVector(_normal,0.4);const d=bubbleData[idx];d.lifetime=bubbleMaxLifetime*(0.6+Math.random()*0.4);d.velocity.set((Math.random()-0.5)*bubbleSpeed*0.2,bubbleSpeed*(0.8+Math.random()*0.4),(Math.random()-0.5)*bubbleSpeed*0.2);d.matrix.identity().setPosition(_position);bubbleMesh.setMatrixAt(idx,d.matrix);}catch(e){console.error("Error resetBubble:",e);if(idx<bubbleData.length)bubbleData[idx].lifetime=0;_matrix.identity().scale(new THREE.Vector3(0,0,0));bubbleMesh.setMatrixAt(idx,_matrix);}
+        }
+        function updateBubbles(dt){ /* ... Bubble update unchanged ... */
+            if(!bubbleMesh||!samplersReady)return;let act=0;const cP=new THREE.Vector3();let nU=false;
+            for(let i=0;i<bubbleMaxCount;i++){const d=bubbleData[i];if(d.lifetime>0){d.lifetime-=dt;if(d.lifetime>0){cP.setFromMatrixPosition(d.matrix).addScaledVector(d.velocity,dt);d.matrix.setPosition(cP);const s=Math.min(1.0,(d.lifetime/bubbleMaxLifetime)*4.0);_matrix.copy(d.matrix);if(s<0.99)_matrix.scale(new THREE.Vector3(s,s,s));bubbleMesh.setMatrixAt(i,_matrix);nU=true;if(cP.y>liquidHeight-0.5)d.lifetime=0;else act++;}if(d.lifetime<=0){_matrix.identity().scale(new THREE.Vector3(0,0,0));bubbleMesh.setMatrixAt(i,_matrix);d.matrix.copy(_matrix);nU=true;}}else{if(simParams.isRunning&&act<bubblesToEmit){resetBubble(i);if(d.lifetime>0){act++;nU=true;}}}}
+            if(nU)bubbleMesh.instanceMatrix.needsUpdate=true;
+        }
+
+        const AMBIENT_PARTICLE_COUNT = 1200; const AMBIENT_DRIFT_SPEED = 1.8;
+        const ambientCO2Color = new THREE.Color(0x87CEFA); const ambientO2Color = new THREE.Color(0xFFB6C1);
+        let ambientGasGeo, ambientGasMaterial, ambientGasSystem;
+        let ambientPositions, ambientColors, ambientAlphas, ambientVelocities, ambientTypes;
+
+        function initAmbientGasVisuals() {
+            try { // Added try-catch for robust initialization
+                if (ambientGasSystem) scene.remove(ambientGasSystem);
+                if (ambientGasGeo) ambientGasGeo.dispose();
+                if (ambientGasMaterial) ambientGasMaterial.dispose();
+
+                ambientGasGeo = new THREE.BufferGeometry();
+                ambientPositions = new Float32Array(AMBIENT_PARTICLE_COUNT * 3);
+                ambientColors = new Float32Array(AMBIENT_PARTICLE_COUNT * 3);
+                ambientAlphas = new Float32Array(AMBIENT_PARTICLE_COUNT);
+                ambientVelocities = new Float32Array(AMBIENT_PARTICLE_COUNT * 3);
+                ambientTypes = new Float32Array(AMBIENT_PARTICLE_COUNT);
+
+                for (let i = 0; i < AMBIENT_PARTICLE_COUNT; i++) {
+                    const r = liquidRadius * Math.sqrt(Math.random()); const theta = Math.random() * Math.PI * 2;
+                    ambientPositions[i * 3 + 0] = r * Math.cos(theta); ambientPositions[i * 3 + 1] = Math.random() * liquidHeight; ambientPositions[i * 3 + 2] = r * Math.sin(theta);
+                    ambientVelocities[i*3+0] = (Math.random() - 0.5) * AMBIENT_DRIFT_SPEED; ambientVelocities[i*3+1] = (Math.random() - 0.5) * AMBIENT_DRIFT_SPEED; ambientVelocities[i*3+2] = (Math.random() - 0.5) * AMBIENT_DRIFT_SPEED;
+                    if (i < AMBIENT_PARTICLE_COUNT / 2) { ambientTypes[i] = 1.0; ambientCO2Color.toArray(ambientColors, i * 3); }
+                    else { ambientTypes[i] = 0.0; ambientO2Color.toArray(ambientColors, i * 3); }
+                    ambientAlphas[i] = 0.0;
+                }
+
+                ambientGasGeo.setAttribute('position', new THREE.BufferAttribute(ambientPositions, 3));
+                ambientGasGeo.setAttribute('color', new THREE.BufferAttribute(ambientColors, 3));
+                ambientGasGeo.setAttribute('alpha', new THREE.BufferAttribute(ambientAlphas, 1));
+ambientGasGeo.setAttribute('velocity', new THREE.BufferAttribute(ambientVelocities, 3));
+ambientGasGeo.setAttribute('type', new THREE.BufferAttribute(ambientTypes, 1));
+
+                console.log("In initAmbientGasVisuals, after setAttribute('alpha'):", ambientGasGeo.attributes.alpha); // DEBUG LOG
+
+                ambientGasMaterial = new THREE.ShaderMaterial({
+                    uniforms: { pointTexture: { value: new THREE.TextureLoader().load('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0Ij48Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSIxMCIgZmlsbD0id2hpdGUiLz48L3N2Zz4=') }},
+                    vertexShader: `attribute float alpha; varying float vAlpha; void main() { vAlpha = alpha; vec4 mvPosition = modelViewMatrix * vec4(position, 1.0); gl_PointSize = 5.0 * (300.0 / -mvPosition.z); gl_Position = projectionMatrix * mvPosition; }`,
+                    fragmentShader: `uniform sampler2D pointTexture; varying float vAlpha; varying vec3 vColor; void main() { gl_FragColor = texture2D(pointTexture, gl_PointCoord); gl_FragColor.rgb *= vColor; gl_FragColor.a *= vAlpha; if (gl_FragColor.a < 0.01) discard; }`,
+                    transparent: true, depthWrite: false, vertexColors: true, blending: THREE.AdditiveBlending
+                });
+                ambientGasSystem = new THREE.Points(ambientGasGeo, ambientGasMaterial);
+                scene.add(ambientGasSystem);
+                console.log("Ambient gas visualization system initialized successfully.");
+            } catch (e) {
+                console.error("ERROR DURING initAmbientGasVisuals:", e);
+            }
+        }
+
+        function updateAmbientGasVisuals(deltaTime) {
+            if (!ambientGasSystem || !guiControls || !ambientGasGeo || !ambientGasGeo.attributes.alpha || !ambientGasGeo.attributes.alpha.array) { // Added robust checks
+                // console.warn("Ambient gas system or its attributes not ready for update."); // Can be spammy
+                return;
+            }
+
+            const positions = ambientGasGeo.attributes.position.array;
+            const alphas = ambientGasGeo.attributes.alpha.array;
+            const velocities = ambientGasGeo.attributes.velocity.array;
+            const types = ambientGasGeo.attributes.type.array;
+            const targetCO2Alpha = Math.min(1.0, Math.max(0.0, (internalState.co2 - 50) / (guiControls.initialCo2 * 1.2)));
+            const targetO2Alpha = Math.min(1.0, Math.max(0.0, (internalState.o2 - 5) / (guiControls.initialO2 * 0.8)));
+            let posNeedsUpdate = false; let alphaNeedsUpdate = false;
+
+            for (let i = 0; i < AMBIENT_PARTICLE_COUNT; i++) {
+                const currentAlpha = alphas[i]; const targetAlpha = types[i] === 1.0 ? targetCO2Alpha : targetO2Alpha;
+                if (Math.abs(currentAlpha - targetAlpha) > 0.01) { alphas[i] += (targetAlpha - currentAlpha) * deltaTime * 2.0; alphaNeedsUpdate = true; }
+                positions[i*3+0] += velocities[i*3+0] * deltaTime; positions[i*3+1] += velocities[i*3+1] * deltaTime; positions[i*3+2] += velocities[i*3+2] * deltaTime; posNeedsUpdate = true;
+                if (positions[i*3+1] < 0 || positions[i*3+1] > liquidHeight) { velocities[i*3+1] *= -1; positions[i*3+1] = Math.max(0.1, Math.min(liquidHeight - 0.1, positions[i*3+1])); }
+                const rSq = positions[i*3+0]*positions[i*3+0] + positions[i*3+2]*positions[i*3+2];
+                if (rSq > liquidRadius * liquidRadius) {
+                    const nW = new THREE.Vector2(positions[i*3+0], positions[i*3+2]).normalize(); const vV = new THREE.Vector2(velocities[i*3+0], velocities[i*3+2]); const dot = vV.dot(nW);
+                    velocities[i*3+0] -= 2 * dot * nW.x; velocities[i*3+2] -= 2 * dot * nW.y;
+                    const r = Math.sqrt(rSq); positions[i*3+0] = (positions[i*3+0] / r) * (liquidRadius - 0.1); positions[i*3+2] = (positions[i*3+2] / r) * (liquidRadius - 0.1);
+                }
+            }
+            if (posNeedsUpdate) ambientGasGeo.attributes.position.needsUpdate = true;
+            if (alphaNeedsUpdate) ambientGasGeo.attributes.alpha.needsUpdate = true;
+        }
+
+
+        const simParams={vMaxPhoto:20.0,kLight:500,kCo2:350,tempOptimumPhoto:28,tempRangePhoto:15,rBase:1.0,tempBaseResp:20,q10Resp:2.0,tempMaxResp:45,chamberVolume:(beakerRadius*beakerRadius*Math.PI*liquidHeight)*0.001,plantSizeFactor:0.6,simulationSpeed:1.0,isRunning:false};
+        let internalState={co2:400.0,o2:21.0}; let currentNetRate=0;
+        let gui,guiControls,envFolder,initialStateFolder,simControlFolder,teachingFolder;
+        function setupGUI(){ /* ... GUI setup unchanged ... */
+            gui=new dat.GUI({width:420});guiControls={externalLightIntensity:150,chamberTemperature:25,initialCo2:400,initialO2:21.0,simulationSpeed:1.0,startStop:function(){simParams.isRunning=!simParams.isRunning;updateUIStatus();},reset:function(){resetSimulation();},setPresetStrongPhoto:function(){setTeachingPreset(1800,28,'强光合作用');},setPresetRespiration:function(){setTeachingPreset(0,25,'呼吸作用为主');},setPresetCompensation:function(){setTeachingPreset(70,25,'光补偿点附近');},setPresetHighTemp:function(){setTeachingPreset(1000,42,'高温胁迫');},setPresetLowTemp:function(){setTeachingPreset(1000,10,'低温影响');}};
+            envFolder=gui.addFolder('环境条件');envFolder.add(guiControls,'externalLightIntensity',0,2000,10).name("外部光强 (µmol)").onChange(updateExternalLight);envFolder.add(guiControls,'chamberTemperature',0,50,0.5).name("小室温度 (°C)");envFolder.open();initialStateFolder=gui.addFolder('初始内部状态');initialStateFolder.add(guiControls,'initialCo2',0,2000,10).name("初始 CO₂ (ppm)");initialStateFolder.add(guiControls,'initialO2',0,30,0.1).name("初始 O₂ (%)");simControlFolder=gui.addFolder('模拟控制');simControlFolder.add(guiControls,'simulationSpeed',0.1,10,0.1).name("模拟速度").onChange(v=>{simParams.simulationSpeed=v;});simControlFolder.add(guiControls,'startStop').name("开始/停止");simControlFolder.add(guiControls,'reset').name("重置状态");simControlFolder.open();teachingFolder=gui.addFolder('教学场景');teachingFolder.add(guiControls,'setPresetStrongPhoto').name('强光合作用');teachingFolder.add(guiControls,'setPresetRespiration').name('呼吸作用为主');teachingFolder.add(guiControls,'setPresetCompensation').name('光补偿点附近');teachingFolder.add(guiControls,'setPresetHighTemp').name('高温胁迫');teachingFolder.add(guiControls,'setPresetLowTemp').name('低温影响');teachingFolder.open();gui.remember(guiControls);return guiControls;
+        }
+        function updateExternalLight(v){if(externalLight)externalLight.intensity=1.2*(v/2000);}
+        function setTeachingPreset(l,t,n){console.log(`Preset: ${n} L:${l} T:${t}`);guiControls.externalLightIntensity=l;guiControls.chamberTemperature=t;if(envFolder&&envFolder.__controllers)envFolder.__controllers.forEach(c=>c.updateDisplay());updateExternalLight(l);if(!simParams.isRunning){simParams.isRunning=true;updateUIStatus();}}
+
+        const simStatusEl=document.getElementById('simStatus');const internalCo2El=document.getElementById('internalCo2');const internalO2El=document.getElementById('internalO2');const grossPhotoRateEl=document.getElementById('grossPhotoRate');const respRateEl=document.getElementById('respRate');const netPhotoRateEl=document.getElementById('netPhotoRate');
+        function updateUIStatus(){if(simStatusEl){simStatusEl.textContent=simParams.isRunning?'运行中':'停止';simStatusEl.style.color=simParams.isRunning?'#90EE90':'#FFCCCB';}}
+        function updateUIOutputs(gp,r,np){if(!internalCo2El)return;internalCo2El.textContent=internalState.co2.toFixed(1);internalO2El.textContent=internalState.o2.toFixed(2);grossPhotoRateEl.textContent=gp.toFixed(2);respRateEl.textContent=r.toFixed(2);netPhotoRateEl.textContent=np.toFixed(2);netPhotoRateEl.style.color=np>=0?'#90EE90':'#FFCCCB';}
+
+        function resetSimulation(){
+            simParams.isRunning=false;internalState.co2=guiControls?guiControls.initialCo2:400;internalState.o2=guiControls?guiControls.initialO2:21.0;targetPlantColor.copy(plantColorLow);if(plantMaterial)plantMaterial.color.copy(plantColorLow);gasParticlesToEmit=0;currentNetRate=0;bubblesToEmit=0;
+            if(gasParticleSystem&&gasParticlesGeo&&gasParticlesGeo.attributes.position){const p=gasParticlesGeo.attributes.position.array;const l=gasParticlesGeo.attributes.lifetime.array;const c=gasParticlesGeo.attributes.color.array;if(p&&l&&c){for(let i=0;i<gasParticleCount;i++){p[i*3+1]=-10000;l[i]=0;colorCO2_default.toArray(c,i*3);}p.needsUpdate=true;l.needsUpdate=true;c.needsUpdate=true;gasParticlesGeo.attributes.position.needsUpdate=true;gasParticlesGeo.attributes.lifetime.needsUpdate=true;gasParticlesGeo.attributes.color.needsUpdate=true;}}
+            if(bubbleMesh&&bubbleData.length===bubbleMaxCount){_matrix.identity().scale(new THREE.Vector3(0,0,0));let m=false;for(let i=0;i<bubbleMaxCount;i++){if(bubbleData[i].lifetime>0){bubbleData[i].lifetime=0;bubbleMesh.setMatrixAt(i,_matrix);m=true;}}if(m)bubbleMesh.instanceMatrix.needsUpdate=true;}
+            
+            // Robust check for resetting ambient gas visuals
+            if (ambientGasSystem && ambientGasGeo && ambientGasGeo.attributes && ambientGasGeo.attributes.alpha && ambientGasGeo.attributes.alpha.array) {
+                const alphas = ambientGasGeo.attributes.alpha.array;
+                for (let i = 0; i < AMBIENT_PARTICLE_COUNT; i++) alphas[i] = 0.0;
+                ambientGasGeo.attributes.alpha.needsUpdate = true;
+            } else {
+                console.warn("Ambient gas system or 'alpha' attribute not fully initialized during resetSimulation. Skipping ambient reset for safety.");
+                 console.log({ ambientGasSystemExists: !!ambientGasSystem, ambientGasGeoExists: !!ambientGasGeo, attrs: ambientGasGeo ? ambientGasGeo.attributes : 'N/A', alphaAttr: (ambientGasGeo && ambientGasGeo.attributes) ? ambientGasGeo.attributes.alpha : 'N/A' });
+            }
+            updateUIOutputs(0,0,0);updateUIStatus();console.log("Sim reset with ambient gas viz.");
+        }
+
+        function calculateGrossPhotosynthesis(l,c,t){l=Math.max(0,l);c=Math.max(0,c);t=Math.max(0,t);const lf=l/(simParams.kLight+l);const cf=c/(simParams.kCo2+c);const td=t-simParams.tempOptimumPhoto;const tf=Math.max(0,1-Math.pow(td/simParams.tempRangePhoto,2));return simParams.vMaxPhoto*lf*cf*tf;}
+        function calculateRespiration(t){t=Math.max(0,t);let r=simParams.rBase*Math.pow(simParams.q10Resp,(t-simParams.tempBaseResp)/10);if(t>simParams.tempMaxResp)r*=Math.max(0,1-(t-simParams.tempMaxResp)/5);return Math.max(0,r);}
+
+        function updateSimulation(dt){ /* ... Simulation logic unchanged ... */
+            if(!simParams.isRunning||dt<=0||dt>0.5){bubblesToEmit=0;gasParticlesToEmit=0;return;}const effDt=dt*simParams.simulationSpeed;const curL=guiControls?guiControls.externalLightIntensity:1000;const curT=guiControls?guiControls.chamberTemperature:25;const curC=internalState.co2;const gp=calculateGrossPhotosynthesis(curL,curC,curT);const r=calculateRespiration(curT);currentNetRate=gp-r;const co2CR=-currentNetRate;const o2CR=currentNetRate;const concF=simParams.plantSizeFactor/simParams.chamberVolume;internalState.co2+=co2CR*concF*effDt;internalState.o2+=(o2CR*concF*effDt)/10000;internalState.co2=Math.max(1,internalState.co2);internalState.o2=Math.max(0.01,internalState.o2);const normRateCol=(currentNetRate/simParams.vMaxPhoto)*1.5+0.3;targetPlantColor.lerpColors(plantColorLow,plantColorHigh,Math.max(0,Math.min(1,normRateCol)));gasParticlesToEmit=Math.floor(Math.abs(currentNetRate/simParams.vMaxPhoto)*gasParticleCount*0.8);if(currentNetRate>0.5)bubblesToEmit=Math.min(bubbleMaxCount,Math.floor((currentNetRate/simParams.vMaxPhoto)*bubbleMaxCount*1.5));else bubblesToEmit=0;updateUIOutputs(gp,r,currentNetRate);
+        }
+
+        function onWindowResize(){if(!camera||!renderer)return;camera.aspect=window.innerWidth/window.innerHeight;camera.updateProjectionMatrix();renderer.setPixelRatio(window.devicePixelRatio);renderer.setSize(window.innerWidth,window.innerHeight);}
+        window.addEventListener('resize',onWindowResize);
+
+        const clock=new THREE.Clock();let animationFrameId;
+        function animate(){
+            animationFrameId=requestAnimationFrame(animate);const dt=clock.getDelta();if(!renderer||!controls||dt<=0)return;controls.update();updateSimulation(dt);
+            if(plantMaterial&&plantMaterial.color)plantMaterial.color.lerp(targetPlantColor,dt*3.0);
+            if(gasParticleSystem&&samplersReady&&gasParticlesGeo.attributes.position){const p=gasParticlesGeo.attributes.position.array;const l=gasParticlesGeo.attributes.lifetime.array;const n=gasParticlesGeo.attributes.originNormal.array;const o=gasParticlesGeo.attributes.isOutward.array;let v=0;const netO2R=currentNetRate>=0;let pu=0,lu=0,cu=0,ou=0;
+                for(let i=0;i<gasParticleCount;i++){if(l[i]>0){l[i]-=dt;lu=1;if(l[i]>0){const d=o[i];const sf=gasSpeed*(0.5+l[i]/gasMaxParticleLifetime);if(n&&i*3+2<n.length){p[i*3+0]+=n[i*3+0]*d*sf*dt;p[i*3+1]+=n[i*3+1]*d*sf*dt;p[i*3+2]+=n[i*3+2]*d*sf*dt;pu=1;}v++;}else{p[i*3+1]=-10000;pu=1;}}
+                if(l[i]<=0){if(simParams.isRunning&&v<gasParticlesToEmit){resetGasParticle(i,netO2R);if(l[i]>0){v++;pu=1;lu=1;cu=1;ou=1;}else if(p[i*3+1]>-9999){p[i*3+1]=-10000;pu=1;}}else if(p[i*3+1]>-9999){p[i*3+1]=-10000;pu=1;}}}
+                if(pu)gasParticlesGeo.attributes.position.needsUpdate=true;if(lu)gasParticlesGeo.attributes.lifetime.needsUpdate=true;if(cu)gasParticlesGeo.attributes.color.needsUpdate=true;if(ou)gasParticlesGeo.attributes.isOutward.needsUpdate=true;}
+            if(bubbleMesh&&samplersReady)updateBubbles(dt);
+            updateAmbientGasVisuals(dt);
+            renderer.render(scene,camera);
+        }
+
+         function initializeApp(){
+             try{
+                 console.log("Initializing application v10.1 (Ambient Gas Viz Fix Attempt)...");
+                 initScene();createBeaker();createPlants();
+                 initAmbientGasVisuals();
+                 guiControls=setupGUI();updateExternalLight(guiControls.externalLightIntensity);resetSimulation();animate();
+                 console.log("Initialization complete with ambient gas visualization.");
+             }catch(e){console.error("Critical Init failed:",e);alert("无法初始化场景.\n请检查浏览器控制台.");}
+         }
+         initializeApp();
+    </script>
+</body>
+</html>
